@@ -534,7 +534,7 @@ build_args_block() {
     # EXTRA_ARGS from --arg CLI — highest precedence.
     if (( ${#EXTRA_ARGS[@]} > 0 )); then
         local extra_json
-        extra_json=$(printf '%s\n' "${EXTRA_ARGS[@]}" | jq -Rc '[inputs]')
+        extra_json=$(printf '%s\n' "${EXTRA_ARGS[@]}" | jq -Rnc '[inputs]')
         all_json=$(jq -c --argjson e "$extra_json" '. + $e' <<< "$all_json")
     fi
 
