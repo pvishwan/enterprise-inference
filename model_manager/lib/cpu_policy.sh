@@ -366,6 +366,10 @@ build_cpu_policy_annotations() {
     CPU_POLICY_ANNOTATIONS=""
     NRI_NODE_SELECTOR_TERM=""
 
+    # device: gpu runtimes carry no CPU-pinning annotations — balloons and
+    # static-CPU alignment are Xeon placement controls.
+    [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" ]] && return 0
+
     cpu_policy_resolve
 
     case "$CPU_POLICY" in

@@ -80,13 +80,15 @@ resolve_model() {
             (.category // ""),
             (.image // ""),
             (.node // ""),
-            (.routing // "")
+            (.routing // ""),
+            (.gpus // "" | tostring)
         ] | join("")') || true  # \x01 (SOH) field delimiter, safe in model names
 
     [[ -z "$fields" ]] && abort "Model '$name' not found in $MM_CONFIG"
 
     IFS=$'\x01' read -r MODEL_NAME MODEL_ID MODEL_KIND MODEL_NAMESPACE \
         MODEL_CPU MODEL_MEMORY MODEL_REPLICAS MODEL_CATEGORY MODEL_IMAGE MODEL_NODE MODEL_ROUTING \
+        MODEL_GPUS \
         <<< "$fields"
 
     # chat_template is resolved separately, NOT through the joined `read` above:
@@ -273,6 +275,12 @@ load_runtime() {
     # MM_RUNTIMES). Empty → deploy falls back to a per-dir serving-runtime.yaml.
     RUNTIME_SERVING_MANIFEST=$(echo "$rj" | jq -r '.serving_runtime_manifest // ""')
 
+    # GPU plumbing — populated only by device: gpu runtimes (runtimes/<n>/values.yaml);
+    # empty for CPU runtimes, which leaves every GPU render path inert.
+    RUNTIME_ACCEL_RESOURCE=$(echo "$rj" | jq -r '.accelerator_resource // ""')
+    RUNTIME_ACCEL_TOLERATION_KEY=$(echo "$rj" | jq -r '.accelerator_toleration_key // ""')
+    RUNTIME_SHM_SIZE=$(echo "$rj" | jq -r '.shm_size // ""')
+
     # Validate the runtime's shared env + selected category args are well-shaped,
     # so a malformed runtimes.<name> entry fails with a clear message rather than
     # a cryptic jq merge error later.
@@ -343,6 +351,12 @@ apply_category_defaults() {
     fi
     if [[ -z "$MODEL_MEMORY" ]]; then
         MODEL_MEMORY=$(echo "$rj" | jq -r --arg c "$category" '.categories[$c].defaults.memory // "16Gi"')
+    fi
+    # GPU count — device: gpu runtimes only. Precedence mirrors cpu/memory:
+    # --gpus → models.yaml gpus → category defaults.gpus → 1. Stays empty on CPU
+    # runtimes so no GPU block is ever rendered for them.
+    if [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" && -z "${MODEL_GPUS:-}" ]]; then
+        MODEL_GPUS=$(echo "$rj" | jq -r --arg c "$category" '.categories[$c].defaults.gpus // 1')
     fi
 }
 

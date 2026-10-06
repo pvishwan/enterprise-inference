@@ -57,6 +57,8 @@ MODEL_SERVER_VERSION=""
 OPT_ID=""; OPT_NAME=""; OPT_SERVER=""; OPT_AS=""
 OPT_CPU=""; OPT_MEMORY=""; OPT_REPLICAS=""
 OPT_TP=""; OPT_SERVER_VERSION=""
+# GPU count override (device: gpu runtimes only). Resolved into MODEL_GPUS.
+OPT_GPUS=""; MODEL_GPUS=""
 # CPU-pinning policy override for this deploy. Empty → MM_CPU_POLICY, then
 # cluster auto-detection (see lib/cpu_policy.sh).
 OPT_CPU_POLICY=""
@@ -104,6 +106,7 @@ ${BOLD}${CYAN}Deploy Options:${RESET}
   ${GREEN}--memory${RESET} NGi         Memory (e.g. 32Gi)
   ${GREEN}--replicas${RESET} N         Replica count (default: 1)
   ${GREEN}--tp${RESET} N               Tensor-parallel size (splits across N NUMA nodes)
+  ${GREEN}--gpus${RESET} N             GPUs per pod (device: gpu runtimes, e.g. vllm-cuda); default --tensor-parallel-size
   ${GREEN}--cpu-policy${RESET} <p>     CPU pinning: nri-balloons | kubelet-static | best-effort
                             (default: MM_CPU_POLICY, else auto-detected)
   ${GREEN}--category${RESET} <cat>     Override category: llm | embed | rerank | vlm
@@ -133,6 +136,9 @@ ${BOLD}${CYAN}For status / scale / logs, use kubectl:${RESET}
 ${BOLD}${CYAN}Environment:${RESET}
   ${GREEN}HF_TOKEN${RESET}              HuggingFace token for gated models
   ${GREEN}MM_CONFIG${RESET}             Path to models.yaml
+  ${GREEN}MM_ACCEL_RESOURCE${RESET}     Accelerator extended resource the cluster advertises (e.g. nvidia.com/gpu).
+                            Required to deploy a device: gpu runtime (vllm-cuda); ai-solutions sets
+                            it in rack-scale mode only
   ${GREEN}MM_CPU_POLICY${RESET}         Cluster CPU policy: nri-balloons (default) |
                         kubelet-static | best-effort. Set by the Ansible
                         install from kubernetes_cpu_policy; --cpu-policy wins.
@@ -169,6 +175,7 @@ parse_args() {
             --memory)       OPT_MEMORY="$2";                   shift 2 ;;
             --replicas)     require_int replicas "$2"; OPT_REPLICAS="$2"; shift 2 ;;
             --tp)           require_int tp "$2"; OPT_TP="$2";  shift 2 ;;
+            --gpus)         require_int gpus "$2"; OPT_GPUS="$2"; shift 2 ;;
             --cpu-policy)   OPT_CPU_POLICY="${2,,}";           shift 2 ;;
             --category)     OPT_CATEGORY="$2";                 shift 2 ;;
             --routing)      OPT_ROUTING="$2";                  shift 2 ;;
@@ -257,6 +264,7 @@ resolve_target() {
         MODEL_REPLICAS="${OPT_REPLICAS:-$DEFAULT_REPLICAS}"
         MODEL_CPU="$OPT_CPU"
         MODEL_MEMORY="$OPT_MEMORY"
+        MODEL_GPUS="$OPT_GPUS"
         MODEL_CATEGORY="$OPT_CATEGORY"
         MODEL_IMAGE=""
         MODEL_NODE="$OPT_NODE"
@@ -295,6 +303,7 @@ resolve_target() {
     apply_category_defaults
     [[ -n "$OPT_CPU"      ]] && MODEL_CPU="$OPT_CPU"
     [[ -n "$OPT_MEMORY"   ]] && MODEL_MEMORY="$OPT_MEMORY"
+    [[ -n "$OPT_GPUS"     ]] && MODEL_GPUS="$OPT_GPUS"
     [[ -n "$OPT_REPLICAS" ]] && MODEL_REPLICAS="$OPT_REPLICAS"
     [[ -n "$OPT_NODE"     ]] && MODEL_NODE="$OPT_NODE"
 
@@ -481,17 +490,40 @@ CHAT_TEMPLATE_VOLUME=""
 build_chat_template_blocks() {
     CHAT_TEMPLATE_MOUNT=""
     CHAT_TEMPLATE_VOLUME=""
-    chat_template_needs_volume || return 0
+    # Both optional volumes share the single volumeMounts:/volumes: key, so the
+    # header is emitted once and each item appended. CPU runtimes with no chat
+    # template produce exactly what they did before: nothing.
+    local want_chat=false want_shm=false
+    chat_template_needs_volume && want_chat=true
+    [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" && -n "${RUNTIME_SHM_SIZE:-}" ]] && want_shm=true
+    [[ "$want_chat" == false && "$want_shm" == false ]] && return 0
+
     CHAT_TEMPLATE_MOUNT="        volumeMounts:
-          - name: chat-template
+"
+    CHAT_TEMPLATE_VOLUME="    volumes:
+"
+    if [[ "$want_chat" == true ]]; then
+        CHAT_TEMPLATE_MOUNT+="          - name: chat-template
             mountPath: ${CHAT_TEMPLATE_MOUNT_PATH}
             readOnly: true
 "
-    CHAT_TEMPLATE_VOLUME="    volumes:
-      - name: chat-template
+        CHAT_TEMPLATE_VOLUME+="      - name: chat-template
         configMap:
           name: $(chat_template_cm_name)
 "
+    fi
+    # /dev/shm: NCCL/torch.distributed need a large shared-memory segment for
+    # tensor parallelism; the container default (64Mi) is not enough.
+    if [[ "$want_shm" == true ]]; then
+        CHAT_TEMPLATE_MOUNT+="          - name: shm
+            mountPath: /dev/shm
+"
+        CHAT_TEMPLATE_VOLUME+="      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: ${RUNTIME_SHM_SIZE}
+"
+    fi
 }
 
 # Args block. Precedence (lowest → highest), deduped by flag name so a higher
@@ -599,12 +631,21 @@ build_labels_block() {
 # Includes soft preference for --node and hard NRI max-tp requirement when applicable.
 # When require_amx is enabled, adds a hard requirement for AMX-capable nodes (NFD label).
 build_affinity_block() {
-    local has_node_pref=false has_nri_req=false has_amx_req=false
+    local has_node_pref=false has_nri_req=false has_amx_req=false has_gpu_pref=false
     [[ -n "$MODEL_NODE" ]] && has_node_pref=true
     [[ -n "${NRI_NODE_SELECTOR_TERM:-}" ]] && has_nri_req=true
     [[ "${DEFAULT_REQUIRE_AMX:-false}" =~ ^(true|1|yes)$ ]] && has_amx_req=true
+    # device: gpu — NRI max-tp and AMX are Xeon placement controls; the
+    # accelerator resource limit does the real scheduling. Add a soft
+    # preference for the vendor label the rack-scale installer applies.
+    local gpu_vendor=""
+    if [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" ]]; then
+        has_nri_req=false; has_amx_req=false
+        gpu_vendor=$(accel_vendor_from_resource "${MM_ACCEL_RESOURCE:-}")
+        [[ -n "$gpu_vendor" ]] && has_gpu_pref=true
+    fi
 
-    [[ "$has_node_pref" == false && "$has_nri_req" == false && "$has_amx_req" == false ]] && return 0
+    [[ "$has_node_pref" == false && "$has_nri_req" == false && "$has_amx_req" == false && "$has_gpu_pref" == false ]] && return 0
 
     echo "    affinity:"
     echo "      nodeAffinity:"
@@ -636,9 +677,10 @@ EOFAMX
         fi
     fi
 
-    if [[ "$has_node_pref" == true ]]; then
-        cat <<EOFPREF
-        preferredDuringSchedulingIgnoredDuringExecution:
+    if [[ "$has_node_pref" == true || "$has_gpu_pref" == true ]]; then
+        echo "        preferredDuringSchedulingIgnoredDuringExecution:"
+        if [[ "$has_node_pref" == true ]]; then
+            cat <<EOFPREF
           - weight: 100
             preference:
               matchExpressions:
@@ -652,6 +694,18 @@ EOFAMX
                 - key: node-role.kubernetes.io/control-plane
                   operator: DoesNotExist
 EOFPREF
+        fi
+        if [[ "$has_gpu_pref" == true ]]; then
+            cat <<EOFGPU
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: gpu-vendor
+                  operator: In
+                  values:
+                    - ${gpu_vendor}
+EOFGPU
+        fi
     fi
 }
 
@@ -674,6 +728,12 @@ resolve_tp_size() {
             TP_SIZE="${EXTRA_ARGS[$((i+1))]:-1}"; return
         fi
     done
+    # GPU runtimes: default TP to the per-pod GPU count so an N-GPU pod shards
+    # across all N. Injected once; the scan above finds it on later calls.
+    if [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" && "${MODEL_GPUS:-1}" -gt 1 ]]; then
+        TP_SIZE="$MODEL_GPUS"
+        EXTRA_ARGS+=("--tensor-parallel-size" "$MODEL_GPUS")
+    fi
 }
 
 # Populate NRI_ANNOTATIONS and NRI_NODE_SELECTOR_TERM.
@@ -732,6 +792,70 @@ nri_preflight_gate() {
           "anyway) or MM_NRI_SKIP_PREFLIGHT=1 (skip check)."
 }
 
+# ── GPU runtime support (device: gpu, e.g. vllm-cuda) ────────────────────────
+
+# Effective accelerator resource: the cluster-advertised one (MM_ACCEL_RESOURCE,
+# exported by llm_services from the accelerator profile / rack-scale flags) wins;
+# the runtime's accelerator_resource is only a preview default for --dry-run.
+accel_effective_resource() {
+    printf '%s' "${MM_ACCEL_RESOURCE:-${RUNTIME_ACCEL_RESOURCE:-}}"
+}
+
+# Vendor label value for the rack-scale installer's gpu-vendor node label,
+# derived from the resource name. Empty when unknown — the preference is skipped.
+accel_vendor_from_resource() {
+    case "${1:-}" in
+        nvidia.com/*)    echo nvidia ;;
+        gpu.intel.com/*) echo intel ;;
+        habana.ai/*)     echo intel ;;
+        amd.com/*)       echo amd ;;
+        *)               echo "" ;;
+    esac
+}
+
+# Deploy gate. A device: gpu runtime is refused unless MM_ACCEL_RESOURCE names
+# the extended resource the cluster advertises (e.g. nvidia.com/gpu). Intel
+# Enterprise AI Solutions sets it only when rack_scale_enabled=true and the
+# rack-profile parser detected an accelerator, so GPU models cannot be deployed
+# by accident on a standard CPU install. --dry-run is a preview and is NOT gated
+# (it warns and renders with the runtime's default resource name instead).
+gpu_runtime_gate() {
+    [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" ]] || return 0
+    if [[ ! "${MODEL_GPUS:-}" =~ ^[1-9][0-9]*$ ]]; then
+        abort "Runtime '$MODEL_RUNTIME' is a GPU runtime but the GPU count is invalid: '${MODEL_GPUS:-}'." \
+              "Set gpus: N on the model, defaults.gpus on its category, or pass --gpus N."
+    fi
+    if [[ -z "${MM_ACCEL_RESOURCE:-}" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            warn "MM_ACCEL_RESOURCE is not set — previewing anyway (--dry-run) with '${RUNTIME_ACCEL_RESOURCE:-?}'. A real deploy of '$MODEL_RUNTIME' would be refused."
+            return 0
+        fi
+        abort "Runtime '$MODEL_RUNTIME' targets a GPU (device: gpu) but no accelerator resource is enabled (MM_ACCEL_RESOURCE is empty)." \
+              "In Intel Enterprise AI Solutions this is set automatically when rack_scale_enabled=true and" \
+              "rack-profile.yaml declares an accelerator: on at least one node. To deploy manually on a" \
+              "cluster you trust: MM_ACCEL_RESOURCE=nvidia.com/gpu ./model-manager deploy $MODEL_NAME"
+    fi
+}
+
+# GPU_RESOURCE: the extended-resource line appended to BOTH resources.requests
+# and resources.limits (the template glues the placeholder to each memory: line,
+# so the fragment is a leading newline + one indented line and never leaves a
+# blank line on CPU). TOLERATIONS: tolerate the taint GPU nodes commonly carry.
+# Both are empty for CPU runtimes, so their template placeholders vanish.
+build_gpu_blocks() {
+    GPU_RESOURCE=""; TOLERATIONS=""
+    [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" ]] || return 0
+    local res; res=$(accel_effective_resource)
+    [[ -n "$res" ]] && GPU_RESOURCE=$'\n'"            ${res}: \"${MODEL_GPUS}\""
+    # No trailing newline: this is the last placeholder in the template and
+    # render_template's echo supplies the final one.
+    [[ -n "${RUNTIME_ACCEL_TOLERATION_KEY:-}" ]] && TOLERATIONS="    tolerations:
+      - key: ${RUNTIME_ACCEL_TOLERATION_KEY}
+        operator: Exists
+        effect: NoSchedule"
+    return 0
+}
+
 render_manifest() {
     local env_block args_block affinity_block labels_block
     resolve_tp_size                      # mutates EXTRA_ARGS; sets TP_SIZE
@@ -748,6 +872,11 @@ render_manifest() {
     affinity_block=$(build_affinity_block)
     build_cpu_policy_annotations "$TP_SIZE"   # sets CPU_POLICY_ANNOTATIONS
     build_chat_template_blocks           # sets CHAT_TEMPLATE_MOUNT / _VOLUME
+    build_gpu_blocks                     # sets GPU_RESOURCE / TOLERATIONS (empty on CPU)
+    # $(build_affinity_block) strips its trailing newline. That was fine while
+    # AFFINITY was the last placeholder; with TOLERATIONS after it, restore the
+    # separator — only when both are present, so CPU output is untouched.
+    [[ -n "$affinity_block" && -n "$TOLERATIONS" ]] && TOLERATIONS=$'\n'"$TOLERATIONS"
 
     case "$MODEL_KIND" in
         LLMInferenceService)
@@ -762,7 +891,9 @@ render_manifest() {
                 "CHAT_TEMPLATE_MOUNT=$CHAT_TEMPLATE_MOUNT" \
                 "CHAT_TEMPLATE_VOLUME=$CHAT_TEMPLATE_VOLUME" \
                 "AFFINITY=$affinity_block" \
-                "EXTRA_LABELS=$labels_block"
+                "EXTRA_LABELS=$labels_block" \
+                "GPU_RESOURCE=$GPU_RESOURCE" \
+                "TOLERATIONS=$TOLERATIONS"
             ;;
         InferenceService)
             local template="$MM_TEMPLATES/inference-service.yaml"
@@ -1161,13 +1292,19 @@ print_endpoints() {
 # ── Commands ────────────────────────────────────────────────────────────────
 cmd_deploy() {
     resolve_target "${1:-}"
+    gpu_runtime_gate
 
     info "Deploying $MODEL_NAME ($MODEL_KIND)"
     info "  Runtime: $MODEL_RUNTIME${RUNTIME_VERSION:+ @ $RUNTIME_VERSION} | Category: $MODEL_CATEGORY | Routing: ${MODEL_ROUTING:-default}"
     info "  CPU: $MODEL_CPU | Memory: $MODEL_MEMORY | Replicas: $MODEL_REPLICAS"
+    [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" ]] && info "  GPUs: $MODEL_GPUS x $(accel_effective_resource)"
     [[ -n "$MODEL_NODE" ]] && info "  Node: $MODEL_NODE"
-    cpu_policy_resolve
-    info "  CPU policy: $CPU_POLICY"
+    if [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" ]]; then
+        info "  CPU policy: n/a (GPU runtime — no CPU pinning)"
+    else
+        cpu_policy_resolve
+        info "  CPU policy: $CPU_POLICY"
+    fi
 
     # Normalise CPU/memory for the policy (kubelet-static rounds cpu to an
     # integer, and to a whole physical core under full-pcpus-only) and reject
@@ -1177,7 +1314,7 @@ cmd_deploy() {
     # Also runs for --dry-run so the previewed manifest is the one that would be
     # applied. The placement pre-flight, by contrast, runs after the spec diff
     # below, so an unchanged re-deploy is not gated on its own reserved cores.
-    cpu_policy_validate_resources
+    [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" ]] || cpu_policy_validate_resources
 
     local manifest
     manifest=$(render_manifest)
@@ -1235,8 +1372,9 @@ cmd_deploy() {
     if [[ "$action" != "skip" ]]; then
         # Enforcing pre-flight for the active CPU policy: block a deploy that
         # cannot be placed (NRI: no physical-core room; kubelet-static: no single
-        # node with enough allocatable CPU) before applying.
-        cpu_policy_preflight_gate
+        # node with enough allocatable CPU) before applying. Not applicable to
+        # GPU runtimes — they carry no CPU-pinning policy.
+        [[ "${RUNTIME_DEVICE:-cpu}" == "gpu" ]] || cpu_policy_preflight_gate
 
         ensure_storage "$MODEL_NAMESPACE"
 
